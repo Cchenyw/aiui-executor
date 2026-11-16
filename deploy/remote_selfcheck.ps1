@@ -3,16 +3,17 @@
 远程节点自检脚本：检查配置 JSON、编码、必要字段、token 来源和网关连通性，
 并把完整结果写入脚本目录下的 selfcheck-output\remote-selfcheck-<时间>.txt。
 
-用法（在远程 Windows 主机上）：
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\remote_selfcheck.ps1
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\remote_selfcheck.ps1 -SkipGatewayCheck
-  powershell -NoProfile -ExecutionPolicy Bypass -File scripts\remote_selfcheck.ps1 `
-      -ProjectRoot D:\ui_test\AIUI_test_v4 -ConfigPath D:\ui_test\AIUI_test_v4\runtime\remote-node.json
+用法（在远程 Windows 主机上，默认按 app/runtime 分离布局）：
+  powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\remote_selfcheck.ps1
+  powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\remote_selfcheck.ps1 -SkipGatewayCheck
+  powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\remote_selfcheck.ps1 `
+      -ProjectRoot D:\AIUI\app -ConfigPath D:\AIUI\runtime\remote-node.json
 
+旧布局（代码和 runtime 混在一起）仍需显式传 -ProjectRoot 和 -ConfigPath。
 注意：脚本不会打印 token 原文，只输出文件头、长度和格式检查结果。
 #>
 param(
-    [string]$ProjectRoot = 'D:\ui_test\AIUI_test_v4',
+    [string]$ProjectRoot = 'D:\AIUI\app',
     [string]$ConfigPath = '',
     [string]$OutputDir = '',
     [switch]$SkipGatewayCheck
@@ -24,7 +25,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
 
 if (-not $ConfigPath) {
-    $ConfigPath = Join-Path $ProjectRoot 'runtime\remote-node.json'
+    $ConfigPath = Join-Path (Split-Path -Parent $ProjectRoot) 'runtime\remote-node.json'
 }
 if (-not [System.IO.Path]::IsPathRooted($ConfigPath)) {
     $ConfigPath = Join-Path $ProjectRoot $ConfigPath

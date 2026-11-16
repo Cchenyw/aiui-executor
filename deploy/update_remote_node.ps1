@@ -8,12 +8,11 @@
   D:\AIUI\app      代码，更新时整体替换
   D:\AIUI\runtime  remote-node.json、secrets、remote-nodes、logs
 
-仓库拆分前的过渡用法（只拉执行机文件，不落平台代码）：
+当前用法（从拆分后的执行机仓库 main 拉取）：
   .\update_remote_node.ps1 -Mode Git `
-    -RepoUrl https://github.com/Cchenyw/AIUI_test_v4.git -Ref master `
-    -SparsePaths aiui/agent,aiui/common,aiui/toolservers,aiui/testapp,scripts,configs,requirements.txt
+    -RepoUrl https://github.com/Cchenyw/aiui-executor.git -Ref main
 
-仓库拆分后的推荐用法（固定 release tag）：
+发布 release 后（固定 release tag）：
   .\update_remote_node.ps1 -Mode Release -RepoUrl https://github.com/Cchenyw/aiui-executor.git -Ref latest
 #>
 param(
