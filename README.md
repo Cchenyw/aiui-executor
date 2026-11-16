@@ -38,3 +38,5 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:/AIUI/deploy/update_remote
 
 脚本默认使用 `py -3`（要求 64 位 Python >= 3.10），也可用 `-PythonVersion 3.13`
 或 `-PythonPath` 指定。
+
+开发协作规范见 [AGENTS.md](AGENTS.md)，执行端实现约束见 [CLAUDE.md](CLAUDE.md)。
