@@ -1,12 +1,16 @@
 """主动领取任务的远程执行端；网络循环独立于 MCP/浏览器线程。"""
 import argparse
 import asyncio
+import getpass
+import importlib.metadata
 import ipaddress
 import json
 import os
 import platform
+import re
 import shutil
 import ssl
+import subprocess
 import sys
 import threading
 import time
@@ -17,7 +21,12 @@ from pathlib import Path
 
 from aiui.agent.node_state import NodeState
 from aiui.agent.runner import Agent
-from aiui.common.node_protocol import VERSION, MAX_BODY_BYTES, ID_RE
+from aiui.common import mcp_runtime, profiles
+from aiui.common.node_protocol import (
+    VERSION, MAX_BODY_BYTES, ID_RE,
+    sanitize_mcp_capabilities, sanitize_runtime, sanitize_slots_recommended,
+)
+from aiui.common.paths import ROOT, RUNTIME_DIR
 
 
 class GatewayError(RuntimeError):
@@ -123,9 +132,94 @@ class DurableReporter:
         pass  # log() 返回前已同步提交，无异步批次需要等待。
 
 
+def _version_file():
+    try:
+        return (ROOT / 'VERSION').read_text(encoding='utf-8-sig').strip()[:200]
+    except OSError:
+        return ''
+
+
+def _command_version(command, args, timeout=3):
+    executable = shutil.which(command)
+    if os.name == 'nt' and executable and not executable.lower().endswith(
+            ('.exe', '.cmd', '.bat', '.com')):
+        for suffix in ('.cmd', '.exe', '.bat'):
+            candidate = shutil.which(command + suffix)
+            if candidate:
+                executable = candidate
+                break
+    if not executable:
+        return ''
+    invocation = [executable, *args]
+    if executable.lower().endswith(('.cmd', '.bat')):
+        invocation = ['cmd.exe', '/c', f'"{executable}" ' + ' '.join(args)]
+    try:
+        kwargs = {}
+        if os.name == 'nt':
+            kwargs['creationflags'] = getattr(subprocess, 'CREATE_NO_WINDOW', 0)
+        done = subprocess.run(invocation, capture_output=True, timeout=timeout, **kwargs)
+        raw = done.stdout or done.stderr or b''
+        text = raw.decode('utf-8', 'replace').strip()
+        return text.splitlines()[0][:200] if text else ''
+    except Exception:
+        return ''
+
+
+def _package_version(name):
+    try:
+        return importlib.metadata.version(name)[:200]
+    except Exception:
+        return ''
+
+
+def _memory_mb():
+    try:
+        if os.name == 'nt':
+            import ctypes
+
+            class MemoryStatusEx(ctypes.Structure):
+                _fields_ = [
+                    ('dwLength', ctypes.c_ulong),
+                    ('dwMemoryLoad', ctypes.c_ulong),
+                    ('ullTotalPhys', ctypes.c_ulonglong),
+                    ('ullAvailPhys', ctypes.c_ulonglong),
+                    ('ullTotalPageFile', ctypes.c_ulonglong),
+                    ('ullAvailPageFile', ctypes.c_ulonglong),
+                    ('ullTotalVirtual', ctypes.c_ulonglong),
+                    ('ullAvailVirtual', ctypes.c_ulonglong),
+                    ('ullAvailExtendedVirtual', ctypes.c_ulonglong),
+                ]
+
+            status = MemoryStatusEx()
+            status.dwLength = ctypes.sizeof(MemoryStatusEx)
+            if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+                return int(status.ullTotalPhys // (1024 * 1024))
+            return None
+        return int(os.sysconf('SC_PAGE_SIZE') * os.sysconf('SC_PHYS_PAGES') // (1024 * 1024))
+    except Exception:
+        return None
+
+
+def _recommend_slots(cpu_cores, memory_mb):
+    if not cpu_cores:
+        return 1
+    if memory_mb and memory_mb < 4096:
+        return 1
+    return max(1, min(2, int(cpu_cores) // 2 or 1))
+
+
+def _mcp_version(mcp):
+    for arg in mcp.get('args') or []:
+        match = re.search(r'@[\w./-]+@([0-9][\w.\-]*)', str(arg))
+        if match:
+            return match.group(1)[:200]
+    return ''
+
+
 class RemoteWorker:
     def __init__(self, config):
         self.config = dict(config)
+        self._started_at = time.time()
         for key in ('node_id', 'machine_id', 'name', 'state_dir', 'platform_url'):
             if not isinstance(config.get(key), str) or not config[key].strip():
                 raise ValueError('节点配置缺少必要字段：' + key)
@@ -158,15 +252,142 @@ class RemoteWorker:
         self._interval = 3
         self._futures = {}
         self._closed = False
+        self._runtime = self._describe_runtime()
+        resources = self._runtime.get('resources') or {}
+        self._slots_recommended = sanitize_slots_recommended(
+            _recommend_slots(resources.get('cpu_cores'), resources.get('memory_mb')))
+        self._mcp_configs = []
+        self._mcp_capabilities = []
+        self._probe_signature = None
+        self._probe_thread = None
+        self._probe_lock = threading.Lock()
+
+    def _describe_runtime(self):
+        chrome = ''
+        candidates = []
+        if self.config.get('chromium'):
+            candidates.append(Path(self.config['chromium']))
+        if os.environ.get('CHROMIUM_EXE'):
+            candidates.append(Path(os.environ['CHROMIUM_EXE']))
+        for base, suffix in (
+                (os.environ.get('PROGRAMFILES', r'C:\Program Files'), 'Google/Chrome/Application/chrome.exe'),
+                (os.environ.get('PROGRAMFILES(X86)', r'C:\Program Files (x86)'), 'Google/Chrome/Application/chrome.exe'),
+                (os.environ.get('LOCALAPPDATA', ''), 'Google/Chrome/Application/chrome.exe')):
+            if base:
+                candidates.append(Path(base) / suffix)
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    chrome = str(candidate)[:200]
+                    break
+            except OSError:
+                continue
+        llm = {}
+        try:
+            from aiui.common.llm import load_llm_config
+            cfg = load_llm_config()
+            llm = {
+                'configured': bool(cfg.get('api_key')),
+                'provider': str(cfg.get('provider') or '')[:200],
+                'model': str(cfg.get('model') or '')[:200],
+                'base_url': str(cfg.get('base_url') or '')[:200],
+            }
+        except Exception:
+            llm = {'configured': False}
+        cpu_cores = os.cpu_count()
+        try:
+            disk_free = int(shutil.disk_usage(str(RUNTIME_DIR)).free // (1024 * 1024))
+        except OSError:
+            disk_free = None
+        runtime = {
+            'agent_version': _version_file(),
+            'protocol': VERSION,
+            'os': platform.system(),
+            'os_version': platform.version(),
+            'arch': platform.machine(),
+            'python': platform.python_version(),
+            'node': _command_version('node', ['--version']),
+            'npm': _command_version('npm', ['--version']),
+            'playwright': _package_version('playwright'),
+            'chrome': chrome,
+            'chrome_detected': bool(chrome),
+            'chromium_configured': bool(self.config.get('chromium')),
+            'account': getpass.getuser(),
+            'scheduled_task': os.environ.get('AIUI_SCHEDULED_TASK', ''),
+            'started_at': self._started_at,
+            'llm': llm,
+            'resources': {
+                'cpu_cores': cpu_cores,
+                'memory_mb': _memory_mb(),
+                'disk_free_mb': disk_free,
+            },
+        }
+        return sanitize_runtime(runtime)
 
     def _body(self, **extra):
         return dict(version=VERSION, node_id=self.config['node_id'],
                     instance_id=self.state.instance_id, **extra)
 
     def _registration(self, dry_run=False):
+        extras = {}
+        if self._runtime:
+            extras['runtime'] = self._runtime
+        if self._slots_recommended is not None:
+            extras['slots_recommended'] = self._slots_recommended
+        if dry_run:
+            extras['dry_run'] = True
         return self._body(machine_id=self.config['machine_id'], name=self.config['name'],
                           os=platform.system(), slots=self.config.get('slots', 1),
-                          mcp_ids=self.config['mcp_ids'], features=['env_profile'], **({'dry_run': True} if dry_run else {}))
+                          mcp_ids=self.config['mcp_ids'], features=['env_profile'], **extras)
+
+    def _start_capability_probe(self):
+        configs = [c for c in self._mcp_configs if isinstance(c, dict) and c.get('id')]
+        if not configs:
+            return
+        signature = json.dumps(configs, sort_keys=True, ensure_ascii=False)
+        with self._probe_lock:
+            if self._probe_thread and self._probe_thread.is_alive():
+                return
+            if signature == self._probe_signature and self._mcp_capabilities:
+                return
+            self._probe_signature = signature
+            self._probe_thread = threading.Thread(
+                target=self._probe_worker, args=(configs,), daemon=True)
+            self._probe_thread.start()
+
+    def _probe_worker(self, configs):
+        results = []
+        for mcp in configs:
+            mcp_id = str(mcp.get('id') or '')
+            if not mcp_id:
+                continue
+            tools, error = [], ''
+            try:
+                tools, error = mcp_runtime.probe_tools(mcp, ROOT, timeout=60)
+            except Exception as exc:
+                error = f'{type(exc).__name__}: {exc}'
+            names = [t.get('name') for t in tools
+                     if isinstance(t, dict) and t.get('name')]
+            cap = {
+                'id': mcp_id,
+                'available': not bool(error),
+                'tool_count': len(names),
+                'tools': names[:128],
+                'profile_capable': profiles.detect_adapter(mcp) is not None,
+                'probed_at': time.time(),
+            }
+            version = _mcp_version(mcp)
+            if version:
+                cap['version'] = version
+            if error:
+                cap['error'] = str(error)[:500]
+            results.append(cap)
+        self._mcp_capabilities = sanitize_mcp_capabilities(results)
+
+    def _heartbeat_extras(self):
+        with self._probe_lock:
+            capabilities = list(self._mcp_capabilities)
+        return {'mcp_capabilities': capabilities} if capabilities else {}
 
     def check(self):
         self.client.request('/v1/register', self._registration(dry_run=True))
@@ -176,7 +397,8 @@ class RemoteWorker:
         # 只报告环境事实；不读取/回显本机 LLM 配置与 Profile 内容。
         return dict(ok=True, python=platform.python_version(), os=platform.system(),
                     node_available=bool(shutil.which('node')), npx_available=bool(shutil.which('npx')),
-                    chromium_configured=bool(chromium), state=self.state.status())
+                    chromium_configured=bool(chromium), runtime=self._runtime,
+                    slots_recommended=self._slots_recommended, state=self.state.status())
 
     def flush_events(self):
         # 每轮有界上传，下一轮可及时执行心跳；确认顺序始终按 durable seq。
@@ -233,9 +455,13 @@ class RemoteWorker:
             if not self._registered:
                 response = self.client.request('/v1/register', self._registration())
                 self.slots = min(self.config.get('slots', 1), int(response.get('slots', self.slots)))
+                self._mcp_configs = [m for m in (response.get('mcps') or [])
+                                     if isinstance(m, dict) and m.get('id')]
+                self._start_capability_probe()
                 self._registered = True
             if time.monotonic() >= self._heartbeat_at:
-                self.client.request('/v1/heartbeat', self._body(active_dispatch_ids=self.state.active_ids()))
+                self.client.request('/v1/heartbeat', self._body(
+                    active_dispatch_ids=self.state.active_ids(), **self._heartbeat_extras()))
                 self._heartbeat_at = time.monotonic() + self._interval
             if not uploaded:
                 return False

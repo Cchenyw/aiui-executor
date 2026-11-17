@@ -104,6 +104,43 @@ class WorkerTests(unittest.TestCase):
             release.set()
             w.agent.pool.shutdown(wait=True)
 
+    def test_registration_reports_runtime_and_probe_capabilities(self):
+        w = self.worker()
+        calls = []
+
+        def request(path, body):
+            calls.append((path, body))
+            if path == '/v1/register':
+                return {'ok': True, 'slots': 1, 'mcps': [{
+                    'id': 'builtin-browser', 'command': '{python}',
+                    'args': ['-m', 'aiui.toolservers.builtin_browser']}]}
+            if path == '/v1/claim':
+                return {'ok': True, 'task': None}
+            return {'ok': True}
+
+        with patch.object(w.client, 'request', side_effect=request), \
+                patch('aiui.agent.remote.mcp_runtime.probe_tools',
+                      return_value=([{'name': 'navigate'}], '')) as probe:
+            self.assertTrue(w.step())
+            registration = next(body for path, body in calls if path == '/v1/register')
+            self.assertEqual(registration['machine_id'], 'm1')
+            self.assertEqual(registration['runtime']['protocol'], 1)
+            self.assertTrue(registration['runtime']['os'])
+            self.assertIn('slots_recommended', registration)
+            deadline = time.time() + 5
+            while time.time() < deadline and not w._mcp_capabilities:
+                time.sleep(0.05)
+            self.assertTrue(w._mcp_capabilities)
+            w._heartbeat_at = 0
+            self.assertTrue(w.step())
+            heartbeat = next(body for path, body in calls
+                             if path == '/v1/heartbeat' and body.get('mcp_capabilities'))
+            capability = heartbeat['mcp_capabilities'][0]
+            self.assertEqual(capability['id'], 'builtin-browser')
+            self.assertEqual(capability['tool_count'], 1)
+            self.assertEqual(capability['tools'], ['navigate'])
+            self.assertTrue(probe.called)
+
     def test_https_uses_validating_context(self):
         import ssl
         original = ssl.create_default_context
