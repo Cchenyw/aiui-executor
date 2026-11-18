@@ -29,10 +29,26 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:/AIUI/deploy/install_remot
 
 ## 更新
 
+生产执行机不允许 Git 时，使用版本化制品包（推荐）：
+
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File D:/AIUI/deploy/update_remote_node.ps1 `
-  -InstallDir D:/AIUI -Mode Release -RepoUrl https://github.com/Cchenyw/aiui-executor.git -Ref latest
+  -InstallDir D:/AIUI -Mode Package `
+  -PackagePath D:/AIUI/incoming/aiui-executor-0.2.0.zip
 ```
+
+制品包与 `SHA256SUMS` 放在同一目录；也可用 `-PackageSha256` 显式指定。
+`-PackageUrl` 支持内部 HTTP(S) 制品地址。能访问 GitHub Release 时可继续使用
+`-Mode Release -RepoUrl https://github.com/Cchenyw/aiui-executor.git -Ref <tag>`。
+
+构建制品：
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build_release.ps1 `
+  -Version 0.2.0 -CommonDir D:/path/to/aiui-common
+```
+
+构建和发布流程见 `docs/remote-node-deployment.md`。
 
 ## Python
 

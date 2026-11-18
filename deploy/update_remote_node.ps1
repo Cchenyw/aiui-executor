@@ -14,6 +14,10 @@
 
 发布 release 后（固定 release tag）：
   .\update_remote_node.ps1 -Mode Release -RepoUrl https://github.com/Cchenyw/aiui-executor.git -Ref latest
+
+无 Git / 内网制品包（推荐给不允许 Git 的执行机）：
+  .\update_remote_node.ps1 -Mode Package -PackagePath D:\incoming\aiui-executor-0.2.0.zip
+  # 默认读取同目录 SHA256SUMS；也可用 -PackageSha256 或显式 -SkipChecksum
 #>
 param(
     [string]$InstallDir = 'D:\AIUI',
@@ -21,8 +25,12 @@ param(
     [string]$RuntimeDir = '',
     [string]$RepoUrl = 'https://github.com/Cchenyw/aiui-executor.git',
     [string]$Ref = 'latest',
-    [ValidateSet('Release', 'Git')][string]$Mode = 'Release',
+    [ValidateSet('Release', 'Git', 'Package')][string]$Mode = 'Release',
     [string[]]$SparsePaths = @(),
+    [string]$PackagePath = '',
+    [string]$PackageUrl = '',
+    [string]$PackageSha256 = '',
+    [switch]$SkipChecksum,
     [string]$PythonPath = '',
     [string]$PythonVersion = '',
     [string]$Wheelhouse = '',
@@ -156,9 +164,62 @@ function Expand-ArchiveFlat([string]$zipPath, [string]$destination) {
     }
 }
 
+function Get-ExpectedPackageHash([string]$zipPath) {
+    if ($PackageSha256) { return $PackageSha256.Trim().ToLower() }
+    $name = Split-Path -Leaf $zipPath
+    $sums = Join-Path (Split-Path -Parent $zipPath) 'SHA256SUMS'
+    if (Test-Path -LiteralPath $sums) {
+        foreach ($line in Get-Content -LiteralPath $sums) {
+            $parts = $line -split '\s+', 2
+            if ($parts.Count -eq 2 -and $parts[1].Trim().TrimStart('*') -eq $name) {
+                return $parts[0].Trim().ToLower()
+            }
+        }
+    }
+    $side = $zipPath + '.sha256'
+    if (Test-Path -LiteralPath $side) {
+        $first = Get-Content -LiteralPath $side -TotalCount 1
+        if ($first) { return (($first -split '\s+')[0]).Trim().ToLower() }
+    }
+    return $null
+}
+
 function Get-StagingCode {
     if (Test-Path -LiteralPath $staging) {
         Remove-Item -LiteralPath $staging -Recurse -Force
+    }
+    if ($Mode -eq 'Package') {
+        $download = $false
+        if ($PackagePath) {
+            $zipPath = [System.IO.Path]::GetFullPath($PackagePath)
+            if (-not (Test-Path -LiteralPath $zipPath)) { throw ('安装包不存在: ' + $zipPath) }
+        } elseif ($PackageUrl) {
+            $zipPath = Join-Path ([System.IO.Path]::GetTempPath()) ('aiui-package-' + [guid]::NewGuid().ToString('N') + '.zip')
+            $download = $true
+            Invoke-WebRequest -Uri $PackageUrl -OutFile $zipPath -UseBasicParsing
+        } else {
+            throw 'Package 模式需要 -PackagePath 或 -PackageUrl'
+        }
+        try {
+            $hash = (Get-FileHash -LiteralPath $zipPath -Algorithm SHA256).Hash.ToLower()
+            $expected = Get-ExpectedPackageHash $zipPath
+            if ($expected -and $expected -ne $hash) {
+                throw ('SHA256 校验失败: 期望 ' + $expected + '，实际 ' + $hash)
+            }
+            if (-not $expected) {
+                if (-not $SkipChecksum) {
+                    throw '安装包缺少校验值：请提供 -PackageSha256、同目录 SHA256SUMS，或显式 -SkipChecksum'
+                }
+                Write-Log '[WARN] 未提供安装包 SHA256，已按 -SkipChecksum 跳过校验'
+            }
+            Write-Log ('安装包: ' + (Split-Path -Leaf $zipPath) + ' (SHA256 ' + $hash + ')')
+            New-Item -ItemType Directory -Force -Path $staging | Out-Null
+            Expand-ArchiveFlat $zipPath $staging
+            Write-Log ('Package 检出: ' + (Split-Path -Leaf $zipPath))
+        } finally {
+            if ($download) { Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue }
+        }
+        return
     }
     if ($Mode -eq 'Git') {
         $git = Get-Command git -ErrorAction SilentlyContinue
@@ -308,6 +369,9 @@ function Invoke-SelfCheck {
         return
     }
     $script = Join-Path $PSScriptRoot 'remote_selfcheck.ps1'
+    if (-not (Test-Path -LiteralPath $script)) {
+        $script = Join-Path $staging 'deploy/remote_selfcheck.ps1'
+    }
     if (-not (Test-Path -LiteralPath $script)) {
         $script = Join-Path $staging 'scripts/remote_selfcheck.ps1'
     }
