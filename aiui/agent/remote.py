@@ -152,7 +152,7 @@ def _command_version(command, args, timeout=3):
         return ''
     invocation = [executable, *args]
     if executable.lower().endswith(('.cmd', '.bat')):
-        invocation = ['cmd.exe', '/c', f'"{executable}" ' + ' '.join(args)]
+        invocation = ['cmd.exe', '/c', 'call', executable, *args]
     try:
         kwargs = {}
         if os.name == 'nt':

@@ -435,5 +435,16 @@ class LoopbackTests(unittest.TestCase):
         self.assertEqual(db.get_run(tid)['state'], 'done')
 
 
+class CommandVersionTests(unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows cmd wrapper')
+    def test_cmd_batch_version_is_read(self):
+        from aiui.agent import remote
+        with tempfile.TemporaryDirectory() as tmp:
+            script = Path(tmp) / 'fake-tool.cmd'
+            script.write_text('@echo 9.8.7\r\n', encoding='utf-8')
+            with patch.object(remote.shutil, 'which', return_value=str(script)):
+                self.assertEqual(remote._command_version('fake-tool', ['--version']), '9.8.7')
+
+
 if __name__ == '__main__':
     unittest.main()
