@@ -402,6 +402,7 @@ $staging = Join-Path $InstallDir ('app.staging-' + $stamp)
 $backup = Join-Path $InstallDir ('app.prev-' + $stamp)
 $failed = Join-Path $InstallDir ('app.failed-' + $stamp)
 $swapped = $false
+$appMoved = $false
 $stopped = $false
 
 try {
@@ -425,8 +426,32 @@ try {
     Invoke-SelfCheck
 
     Write-Log ('切换 app 目录: ' + $AppDir + ' -> ' + $backup)
-    Rename-Item -LiteralPath $AppDir -NewName (Split-Path -Leaf $backup)
-    Rename-Item -LiteralPath $staging -NewName (Split-Path -Leaf $AppDir)
+    $moved = $false
+    for ($i = 1; $i -le 10; $i++) {
+        try {
+            Rename-Item -LiteralPath $AppDir -NewName (Split-Path -Leaf $backup) -ErrorAction Stop
+            $moved = $true
+            break
+        } catch {
+            Write-Log ('重试 app -> backup (' + $i + '/10): ' + $_.Exception.Message)
+            Start-Sleep -Seconds 2
+        }
+    }
+    if (-not $moved) { throw '无法把 app 改名为备份（目录可能被占用）' }
+    $appMoved = $true
+
+    $moved = $false
+    for ($i = 1; $i -le 20; $i++) {
+        try {
+            Rename-Item -LiteralPath $staging -NewName (Split-Path -Leaf $AppDir) -ErrorAction Stop
+            $moved = $true
+            break
+        } catch {
+            Write-Log ('重试 staging -> app (' + $i + '/20): ' + $_.Exception.Message)
+            Start-Sleep -Seconds 2
+        }
+    }
+    if (-not $moved) { throw '无法把 staging 切换为 app（目录可能被占用）' }
     $swapped = $true
     Start-Node
     Write-Log '更新完成'
@@ -435,6 +460,15 @@ try {
     Write-Log ('更新失败: ' + $message)
     if ($swapped) {
         Write-Log '回滚到上一个版本'
+        if (Test-Path -LiteralPath $AppDir) {
+            Rename-Item -LiteralPath $AppDir -NewName (Split-Path -Leaf $failed) -ErrorAction SilentlyContinue
+        }
+        if (Test-Path -LiteralPath $backup) {
+            Rename-Item -LiteralPath $backup -NewName (Split-Path -Leaf $AppDir) -ErrorAction SilentlyContinue
+        }
+        Start-Node
+    } elseif ($appMoved) {
+        Write-Log 'app 已改名为备份但 staging 未切换，恢复原 app 目录'
         if (Test-Path -LiteralPath $AppDir) {
             Rename-Item -LiteralPath $AppDir -NewName (Split-Path -Leaf $failed) -ErrorAction SilentlyContinue
         }
