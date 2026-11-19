@@ -7,11 +7,11 @@ import ipaddress
 import json
 import os
 import platform
-import re
 import shutil
 import ssl
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -21,7 +21,6 @@ from pathlib import Path
 
 from aiui.agent.node_state import NodeState
 from aiui.agent.runner import Agent
-from aiui.common import mcp_runtime, profiles
 from aiui.common.node_protocol import (
     VERSION, MAX_BODY_BYTES, ID_RE,
     sanitize_mcp_capabilities, sanitize_runtime, sanitize_slots_recommended,
@@ -208,14 +207,6 @@ def _recommend_slots(cpu_cores, memory_mb):
     return max(1, min(2, int(cpu_cores) // 2 or 1))
 
 
-def _mcp_version(mcp):
-    for arg in mcp.get('args') or []:
-        match = re.search(r'@[\w./-]+@([0-9][\w.\-]*)', str(arg))
-        if match:
-            return match.group(1)[:200]
-    return ''
-
-
 class RemoteWorker:
     def __init__(self, config):
         self.config = dict(config)
@@ -355,33 +346,49 @@ class RemoteWorker:
                 target=self._probe_worker, args=(configs,), daemon=True)
             self._probe_thread.start()
 
+    @staticmethod
+    def _probe_error_cap(mcp, exc):
+        return {
+            'id': str(mcp.get('id') or ''),
+            'available': False,
+            'tool_count': 0,
+            'tools': [],
+            'profile_capable': False,
+            'probed_at': time.time(),
+            'error': f'{type(exc).__name__}: {exc}'[:500],
+        }
+
     def _probe_worker(self, configs):
+        """在独立子进程中探测，浏览器/Node 崩溃不会带走 worker。"""
         results = []
-        for mcp in configs:
-            mcp_id = str(mcp.get('id') or '')
-            if not mcp_id:
-                continue
-            tools, error = [], ''
-            try:
-                tools, error = mcp_runtime.probe_tools(mcp, ROOT, timeout=60)
-            except Exception as exc:
-                error = f'{type(exc).__name__}: {exc}'
-            names = [t.get('name') for t in tools
-                     if isinstance(t, dict) and t.get('name')]
-            cap = {
-                'id': mcp_id,
-                'available': not bool(error),
-                'tool_count': len(names),
-                'tools': names[:128],
-                'profile_capable': profiles.detect_adapter(mcp) is not None,
-                'probed_at': time.time(),
-            }
-            version = _mcp_version(mcp)
-            if version:
-                cap['version'] = version
-            if error:
-                cap['error'] = str(error)[:500]
-            results.append(cap)
+        try:
+            with tempfile.TemporaryDirectory(prefix='aiui-probe-') as temp_dir:
+                config_path = Path(temp_dir) / 'configs.json'
+                output_path = Path(temp_dir) / 'result.json'
+                config_path.write_text(json.dumps(configs, ensure_ascii=False), encoding='utf-8')
+                cmd = [sys.executable, '-B', '-m', 'aiui.agent.probe',
+                       '--config', str(config_path), '--output', str(output_path)]
+                flags = getattr(subprocess, 'CREATE_NEW_PROCESS_GROUP', 0) if os.name == 'nt' else 0
+                proc = subprocess.Popen(
+                    cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    creationflags=flags)
+                try:
+                    stdout, stderr = proc.communicate(timeout=180)
+                except subprocess.TimeoutExpired:
+                    if os.name == 'nt':
+                        subprocess.run(['taskkill', '/PID', str(proc.pid), '/T', '/F'],
+                                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                    else:
+                        proc.kill()
+                    proc.communicate()
+                    raise RuntimeError('probe subprocess timeout')
+                if proc.returncode != 0 or not output_path.is_file():
+                    detail = (stderr or b'').decode('utf-8', 'replace').strip()[:300]
+                    raise RuntimeError(f'probe subprocess exit {proc.returncode}: {detail}')
+                results = json.loads(output_path.read_text(encoding='utf-8'))
+        except BaseException as exc:
+            results = [self._probe_error_cap(c, exc)
+                       for c in configs if isinstance(c, dict) and c.get('id')]
         self._mcp_capabilities = sanitize_mcp_capabilities(results)
 
     def _heartbeat_extras(self):

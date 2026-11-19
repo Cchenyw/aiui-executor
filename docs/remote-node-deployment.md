@@ -102,6 +102,25 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\update_remote
 powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\update_remote_node.ps1 `
   -InstallDir D:\AIUI -Mode Release `
   -RepoUrl https://github.com/Cchenyw/aiui-executor.git -Ref latest
+
+# 不允许 git / 无法访问 GitHub：从制品 zip 更新（推荐）
+powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\update_remote_node.ps1 `
+  -InstallDir D:\AIUI -Mode Package `
+  -PackagePath D:\AIUI\incoming\aiui-executor-0.2.0.zip
+```
+
+`-Mode Package` 默认读取 zip 同目录的 `SHA256SUMS`，也支持
+`-PackageSha256 <hash>`；找不到任何校验值时会拒绝更新，只有显式
+`-SkipChecksum` 才跳过。`-PackageUrl` 可用于内部 HTTP(S) 制品地址，但下载后的
+URL 包不会自动获取同目录 `SHA256SUMS`，应同时传 `-PackageSha256`。
+
+推荐制品目录（只读共享或内部制品库）：
+
+```text
+\\fileserver\aiui\executor\v0.2.0\
+  aiui-executor-0.2.0.zip
+  SHA256SUMS
+  BUILD_INFO.json
 ```
 
 更新流程：拉取到 `app.staging-*` → 校验（有 `SHA256SUMS` 时）→ 安装依赖 →
@@ -118,6 +137,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\update_remote
 - `-Chromium <exe>`：使用系统 Chrome/Edge，写入 `remote-node.json` 并跳过 Playwright 下载。
 - `-KeepBackups N`：保留最近 N 个 `app.prev-*` 版本。
 - `-GitHubTokenEnv <变量名>`：私有仓库只读令牌的环境变量名，默认 `AIUI_GITHUB_TOKEN`。
+- `-PackagePath <zip>`：本地或 UNC 制品包路径（Package 模式）。
+- `-PackageUrl <url>`：内部 HTTP(S) 制品包地址（Package 模式）。
+- `-PackageSha256 <hash>`：制品包 SHA-256；不提供时读取同目录 `SHA256SUMS`。
+- `-SkipChecksum`：显式跳过制品包校验，仅用于临时排障，不建议长期使用。
+
+远程执行机不应使用 `-Mode Git`；Git 模式只用于开发机。生产升级统一使用
+`-Mode Package`（内部制品包）或 `-Mode Release`（可访问 GitHub Release 时）。
 
 ## Chromium 安装失败
 
