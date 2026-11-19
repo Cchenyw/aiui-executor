@@ -319,6 +319,18 @@ class RemoteWorker:
         return dict(version=VERSION, node_id=self.config['node_id'],
                     instance_id=self.state.instance_id, **extra)
 
+    def _apply_heartbeat_slots(self, reply):
+        """跟随平台授权：心跳回传 min(声明, 平台授权) 的实际生效容量。
+
+        旧平台不返回 slots 时保持当前值；返回值永远不会超过本机声明。
+        """
+        if not isinstance(reply, dict):
+            return
+        slots = reply.get('slots')
+        if type(slots) is not int or not 1 <= slots <= 128:
+            return
+        self.slots = min(self.config.get('slots', 1), slots)
+
     def _registration(self, dry_run=False):
         extras = {}
         if self._runtime:
@@ -467,8 +479,9 @@ class RemoteWorker:
                 self._start_capability_probe()
                 self._registered = True
             if time.monotonic() >= self._heartbeat_at:
-                self.client.request('/v1/heartbeat', self._body(
+                reply = self.client.request('/v1/heartbeat', self._body(
                     active_dispatch_ids=self.state.active_ids(), **self._heartbeat_extras()))
+                self._apply_heartbeat_slots(reply)
                 self._heartbeat_at = time.monotonic() + self._interval
             if not uploaded:
                 return False
