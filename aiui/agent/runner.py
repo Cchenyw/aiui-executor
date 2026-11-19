@@ -41,6 +41,26 @@ FALLBACK_MCP = {
     "env": {}, "url": "", "headers": {},
 }
 
+OFFICIAL_PLAYWRIGHT_MCP = "@playwright/mcp"
+
+
+def ensure_mcp_isolation(mcp):
+    """并发执行时保证官方 Playwright MCP 使用独立浏览器 profile。
+
+    每个任务本来就会建立独立的 stdio MCP 会话和子进程；官方 Playwright MCP
+    默认复用持久 profile，多个实例会互相影响，因此缺少 --isolated 时自动补上。
+    内置 MCP 每个进程自行启动临时浏览器，其它 MCP 保持配置原样。
+    """
+    if not isinstance(mcp, dict) or (mcp.get("transport") or "stdio").lower() != "stdio":
+        return mcp
+    args = [str(a) for a in (mcp.get("args") or [])]
+    text = " ".join([str(mcp.get("command") or ""), *args]).lower()
+    if OFFICIAL_PLAYWRIGHT_MCP not in text or "--isolated" in args:
+        return mcp
+    out = dict(mcp)
+    out["args"] = list(mcp.get("args") or []) + ["--isolated"]
+    return out
+
 
 def log(*a):
     print("[agent]", *a, file=sys.stderr, flush=True)
@@ -263,6 +283,11 @@ class Agent:
         """一个任务 = 一个 MCP 会话 + 一个独立浏览器（取决于 MCP 实现）。"""
         case = task.get("case") or {}
         mcp = task.get("mcp") or FALLBACK_MCP
+        isolated = ensure_mcp_isolation(mcp)
+        if isolated is not mcp:
+            reporter.log("并发隔离：官方 Playwright MCP 未配置 --isolated，已自动追加",
+                         source="mcp")
+            mcp = isolated
         if self.chromium:
             mcp = dict(mcp)
             env = dict(mcp.get("env") or {})
