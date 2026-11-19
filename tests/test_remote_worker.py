@@ -104,6 +104,35 @@ class WorkerTests(unittest.TestCase):
             release.set()
             w.agent.pool.shutdown(wait=True)
 
+    def test_heartbeat_follows_platform_slot_grant_within_declared_cap(self):
+        self.config['slots'] = 2
+        w = self.worker()
+        grant = {'slots': 1}
+        def request(path, body):
+            if path == '/v1/register':
+                return {'ok': True, 'slots': 2, 'mcps': []}
+            if path == '/v1/heartbeat':
+                reply = {'ok': True}
+                if grant['slots'] is not None:
+                    reply['slots'] = grant['slots']
+                return reply
+            return {'ok': True, 'task': None}
+        with patch.object(w.client, 'request', side_effect=request):
+            self.assertTrue(w.step())      # 注册 + 首次心跳
+            self.assertEqual(w.slots, 1)   # 平台授权 1
+            grant['slots'] = 2
+            w._heartbeat_at = 0
+            self.assertTrue(w.step())
+            self.assertEqual(w.slots, 2)   # 调高授权即时生效
+            grant['slots'] = 5
+            w._heartbeat_at = 0
+            self.assertTrue(w.step())
+            self.assertEqual(w.slots, 2)   # 不超过本机声明
+            grant['slots'] = None
+            w._heartbeat_at = 0
+            self.assertTrue(w.step())
+            self.assertEqual(w.slots, 2)   # 旧平台不回传时保持现值
+
     def test_registration_reports_runtime_and_probe_capabilities(self):
         w = self.worker()
         calls = []
