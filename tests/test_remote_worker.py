@@ -118,9 +118,21 @@ class WorkerTests(unittest.TestCase):
                 return {'ok': True, 'task': None}
             return {'ok': True}
 
+        class FakeProbeProcess:
+            def __init__(self, cmd, **kwargs):
+                self.returncode = 0
+                self.pid = 1234
+                output = Path(cmd[cmd.index('--output') + 1])
+                output.write_text(json.dumps([{
+                    'id': 'builtin-browser', 'available': True, 'tool_count': 1,
+                    'tools': ['navigate'], 'profile_capable': True,
+                }]), encoding='utf-8')
+
+            def communicate(self, timeout=None):
+                return b'', b''
+
         with patch.object(w.client, 'request', side_effect=request), \
-                patch('aiui.agent.remote.mcp_runtime.probe_tools',
-                      return_value=([{'name': 'navigate'}], '')) as probe:
+                patch('aiui.agent.remote.subprocess.Popen', new=FakeProbeProcess):
             self.assertTrue(w.step())
             registration = next(body for path, body in calls if path == '/v1/register')
             self.assertEqual(registration['machine_id'], 'm1')
@@ -139,7 +151,6 @@ class WorkerTests(unittest.TestCase):
             self.assertEqual(capability['id'], 'builtin-browser')
             self.assertEqual(capability['tool_count'], 1)
             self.assertEqual(capability['tools'], ['navigate'])
-            self.assertTrue(probe.called)
 
     def test_https_uses_validating_context(self):
         import ssl
@@ -433,6 +444,34 @@ class LoopbackTests(unittest.TestCase):
         w.flush_events()
         self.assertEqual(w.state.events(), [])
         self.assertEqual(db.get_run(tid)['state'], 'done')
+
+
+class ProbeIsolationTests(unittest.TestCase):
+    def test_probe_subprocess_failure_becomes_unavailable_capability(self):
+        from aiui.agent.remote import RemoteWorker
+        with tempfile.TemporaryDirectory() as tmp:
+            config = dict(platform_url='http://127.0.0.1:1', node_id='n1', machine_id='m1',
+                          name='Node', mcp_ids=['builtin-browser'], state_dir=str(Path(tmp) / 'node'),
+                          token_env='TEST_REMOTE_TOKEN')
+            with patch.dict(os.environ, TEST_REMOTE_TOKEN='secret'):
+                worker = RemoteWorker(config)
+                try:
+                    with patch('aiui.agent.remote.subprocess.Popen', side_effect=OSError('boom')):
+                        worker._probe_worker([{'id': 'builtin-browser'}])
+                finally:
+                    worker.close()
+        self.assertEqual(len(worker._mcp_capabilities), 1)
+        self.assertFalse(worker._mcp_capabilities[0]['available'])
+        self.assertIn('OSError', worker._mcp_capabilities[0]['error'])
+
+    def test_probe_module_accepts_empty_config(self):
+        from aiui.agent import probe
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg = Path(tmp) / 'configs.json'
+            out = Path(tmp) / 'result.json'
+            cfg.write_text('[]', encoding='utf-8')
+            self.assertEqual(probe.main(['--config', str(cfg), '--output', str(out)]), 0)
+            self.assertEqual(json.loads(out.read_text(encoding='utf-8')), [])
 
 
 class CommandVersionTests(unittest.TestCase):
