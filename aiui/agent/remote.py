@@ -29,6 +29,14 @@ from aiui.common.node_protocol import (
 from aiui.common.paths import ROOT, RUNTIME_DIR
 
 
+def _safe_stderr(message):
+    """诊断输出不能成为致命路径：计划任务下的 stderr 可能已断开/关闭。"""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
 def _write_crash_report(exc, context):
     """把未捕获异常的完整堆栈写入运行目录，供远程执行机排障。"""
     try:
@@ -528,7 +536,7 @@ class RemoteWorker:
                     if not success:
                         error = self.state.status()['last_error']
                         if error != last_reported:
-                            print('[remote] ' + error, file=sys.stderr, flush=True)
+                            _safe_stderr('[remote] ' + error)
                             last_reported = error
                     else:
                         last_reported = None
@@ -539,7 +547,7 @@ class RemoteWorker:
                     signature = (type(exc).__name__, str(exc))
                     if signature != last_crash:
                         _write_crash_report(exc, '主循环异常')
-                        print('[remote] 主循环异常: ' + type(exc).__name__, file=sys.stderr, flush=True)
+                        _safe_stderr('[remote] 主循环异常: ' + type(exc).__name__)
                         last_crash = signature
                     success = False
                 backoff = 0.25 if success else min(backoff * 2, 10)
@@ -575,7 +583,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 0
     except GatewayError as exc:
-        print('远程节点启动或自检失败：' + str(exc), file=sys.stderr)
+        _write_crash_report(exc, '启动或自检异常（GatewayError）')
+        _safe_stderr('远程节点启动或自检失败：' + str(exc))
         return 1
     except Exception as exc:
         if isinstance(exc, FileNotFoundError):
@@ -590,12 +599,15 @@ def main(argv=None):
             detail = '状态目录可能已由另一进程占用'
         else:
             detail = '本机初始化失败，请检查运行环境'
-        print('远程节点启动或自检失败（%s）：%s' % (type(exc).__name__, detail), file=sys.stderr)
         _write_crash_report(exc, '启动或退出异常')
+        _safe_stderr('远程节点启动或自检失败（%s）：%s' % (type(exc).__name__, detail))
         return 1
     finally:
         if worker:
-            worker.close()
+            try:
+                worker.close()
+            except Exception as exc:
+                _write_crash_report(exc, '关闭 worker 异常')
 
 
 if __name__ == '__main__':

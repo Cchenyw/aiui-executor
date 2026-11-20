@@ -152,7 +152,7 @@ $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
 $logDir = '{2}'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-& '{3}' -Config '{4}' *>> '{5}'
+& '{3}' -Config '{4}' -LogFile '{5}'
 exit $LASTEXITCODE
 '@ -f $RuntimeDir, $BrowsersPath, (Join-Path $RuntimeDir 'logs'), (Join-Path $AppDir 'scripts/start_remote_node.ps1'), $configPath, (Join-Path $RuntimeDir 'logs/remote-node.log')
 Set-Content -LiteralPath $launcher -Value $launcherText -Encoding utf8
