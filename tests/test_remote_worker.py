@@ -133,6 +133,28 @@ class WorkerTests(unittest.TestCase):
             self.assertTrue(w.step())
             self.assertEqual(w.slots, 2)   # 旧平台不回传时保持现值
 
+    def test_run_loop_survives_step_exception_and_writes_crash_log(self):
+        from aiui.agent import remote as remote_module
+        self.config['state_dir'] = str(self.root / 'crash-loop')
+        w = self.worker()
+        calls = {'n': 0}
+
+        def fake_step():
+            calls['n'] += 1
+            if calls['n'] == 1:
+                raise RuntimeError('boom')
+            w.stop_flag.set()
+            return True
+
+        with patch.object(w, 'step', fake_step), \
+                patch.object(remote_module, 'RUNTIME_DIR', self.root):
+            w.run()
+        self.assertEqual(calls['n'], 2)
+        crash = (self.root / 'logs' / 'worker-crash.log').read_text(encoding='utf-8')
+        self.assertIn('主循环异常', crash)
+        self.assertIn('RuntimeError', crash)
+        self.assertIn('boom', crash)
+
     def test_registration_reports_runtime_and_probe_capabilities(self):
         w = self.worker()
         calls = []
