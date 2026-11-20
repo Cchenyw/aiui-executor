@@ -14,6 +14,7 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -26,6 +27,29 @@ from aiui.common.node_protocol import (
     sanitize_mcp_capabilities, sanitize_runtime, sanitize_slots_recommended,
 )
 from aiui.common.paths import ROOT, RUNTIME_DIR
+
+
+def _safe_stderr(message):
+    """诊断输出不能成为致命路径：计划任务下的 stderr 可能已断开/关闭。"""
+    try:
+        print(message, file=sys.stderr, flush=True)
+    except Exception:
+        pass
+
+
+def _write_crash_report(exc, context):
+    """把未捕获异常的完整堆栈写入运行目录，供远程执行机排障。"""
+    try:
+        detail = ''.join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    except Exception:
+        detail = repr(exc)
+    try:
+        log_dir = Path(RUNTIME_DIR) / 'logs'
+        log_dir.mkdir(parents=True, exist_ok=True)
+        with (log_dir / 'worker-crash.log').open('a', encoding='utf-8') as stream:
+            stream.write(time.strftime('[%Y-%m-%d %H:%M:%S] ') + context + '\n' + detail + '\n')
+    except Exception:
+        pass
 
 
 class GatewayError(RuntimeError):
@@ -504,16 +528,28 @@ class RemoteWorker:
     def run(self):
         backoff = 0.25
         last_reported = None
+        last_crash = None
         try:
             while not self.stop_flag.is_set():
-                success = self.step()
-                if not success:
-                    error = self.state.status()['last_error']
-                    if error != last_reported:
-                        print('[remote] ' + error, file=sys.stderr, flush=True)
-                        last_reported = error
-                else:
-                    last_reported = None
+                try:
+                    success = self.step()
+                    if not success:
+                        error = self.state.status()['last_error']
+                        if error != last_reported:
+                            _safe_stderr('[remote] ' + error)
+                            last_reported = error
+                    else:
+                        last_reported = None
+                        last_crash = None
+                except Exception as exc:
+                    # 单次异常不能让 worker 退出：记录完整堆栈后按退避继续重试，
+                    # 避免平台重启/瞬时磁盘或网络错误导致节点永久离线。
+                    signature = (type(exc).__name__, str(exc))
+                    if signature != last_crash:
+                        _write_crash_report(exc, '主循环异常')
+                        _safe_stderr('[remote] 主循环异常: ' + type(exc).__name__)
+                        last_crash = signature
+                    success = False
                 backoff = 0.25 if success else min(backoff * 2, 10)
                 if self._registered:
                     backoff = min(backoff, self._interval)
@@ -547,7 +583,8 @@ def main(argv=None):
     except KeyboardInterrupt:
         return 0
     except GatewayError as exc:
-        print('远程节点启动或自检失败：' + str(exc), file=sys.stderr)
+        _write_crash_report(exc, '启动或自检异常（GatewayError）')
+        _safe_stderr('远程节点启动或自检失败：' + str(exc))
         return 1
     except Exception as exc:
         if isinstance(exc, FileNotFoundError):
@@ -562,11 +599,15 @@ def main(argv=None):
             detail = '状态目录可能已由另一进程占用'
         else:
             detail = '本机初始化失败，请检查运行环境'
-        print('远程节点启动或自检失败（%s）：%s' % (type(exc).__name__, detail), file=sys.stderr)
+        _write_crash_report(exc, '启动或退出异常')
+        _safe_stderr('远程节点启动或自检失败（%s）：%s' % (type(exc).__name__, detail))
         return 1
     finally:
         if worker:
-            worker.close()
+            try:
+                worker.close()
+            except Exception as exc:
+                _write_crash_report(exc, '关闭 worker 异常')
 
 
 if __name__ == '__main__':
