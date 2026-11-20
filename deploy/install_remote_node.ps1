@@ -152,9 +152,17 @@ $env:PYTHONIOENCODING = 'utf-8'
 $env:PYTHONUTF8 = '1'
 $logDir = '{2}'
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
-& '{3}' -Config '{4}' -LogFile '{5}'
-exit $LASTEXITCODE
-'@ -f $RuntimeDir, $BrowsersPath, (Join-Path $RuntimeDir 'logs'), (Join-Path $AppDir 'scripts/start_remote_node.ps1'), $configPath, (Join-Path $RuntimeDir 'logs/remote-node.log')
+# 不要用 PowerShell 管道/*>> 包装 Python：平台短暂断开后第一次错误输出会让
+# 管道失败并结束整个任务，worker 被一并带走。Start-Process 直接把子进程的
+# stdout/stderr 接到文件句柄，worker 可以在平台重启后继续重连。
+$p = Start-Process -FilePath '{3}' `
+    -ArgumentList @('-B', '-m', 'aiui.agent.remote', '--config', '{4}') `
+    -PassThru -RedirectStandardOutput (Join-Path $logDir 'remote-node.out.log') `
+    -RedirectStandardError (Join-Path $logDir 'remote-node.log') `
+    -WindowStyle Hidden -Wait
+"EXIT=" + $p.ExitCode + " " + (Get-Date -Format o) | Out-File (Join-Path $logDir 'worker-exit.log') -Append -Encoding utf8
+exit $p.ExitCode
+'@ -f $RuntimeDir, $BrowsersPath, (Join-Path $RuntimeDir 'logs'), (Join-Path $AppDir '.venv\Scripts\python.exe'), $configPath
 Set-Content -LiteralPath $launcher -Value $launcherText -Encoding utf8
 Write-Host ('已写入启动器: ' + $launcher)
 
