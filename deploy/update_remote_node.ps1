@@ -137,6 +137,27 @@ function Start-Node {
     Write-Log ('未找到计划任务；请手动启动: ' + $cmd)
 }
 
+function Stop-DirectoryHolders([string]$directory) {
+    # Windows 只有在目录内不再有打开的句柄时才允许改名。自检退出后可能留下
+    # 仍指向 staging 的 python/node 进程，或杀软/索引器短暂持有文件句柄。
+    $holders = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ProcessId -ne $PID -and (
+                ($_.ExecutablePath -and $_.ExecutablePath.StartsWith($directory, [System.StringComparison]::OrdinalIgnoreCase)) -or
+                ($_.CommandLine -and $_.CommandLine.IndexOf($directory, [System.StringComparison]::OrdinalIgnoreCase) -ge 0))
+        })
+    if ($holders.Count -eq 0) { return }
+    foreach ($proc in $holders) {
+        try {
+            Write-Log ('停止占用 staging 的进程: ' + $proc.Name + ' (' + $proc.ProcessId + ')')
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction Stop
+        } catch {
+            Write-Log ('停止进程失败 (' + $proc.ProcessId + '): ' + $_.Exception.Message)
+        }
+    }
+    Start-Sleep -Seconds 2
+}
+
 function Resolve-GitHubSlug([string]$url) {
     $clean = $url.Trim().TrimEnd('/')
     if ($clean -match 'github\.com[:/](?<owner>[^/]+)/(?<repo>[^/]+?)(?:\.git)?$') {
@@ -390,9 +411,19 @@ Write-Log ('模式: ' + $Mode + ' | 仓库: ' + $RepoUrl + ' | 版本: ' + $Ref)
 Write-Log ('App: ' + $AppDir)
 Write-Log ('Runtime: ' + $RuntimeDir)
 
-if (-not (Test-Path -LiteralPath $InstallDir)) { throw ('安装目录不存在: ' + $InstallDir) }
-if (-not (Test-Path -LiteralPath $AppDir)) { throw ('app 目录不存在: ' + $AppDir + '；请先执行安装/迁移脚本。') }
-if (-not (Test-Path -LiteralPath $configPath)) { throw ('缺少运行配置: ' + $configPath) }
+if (-not (Test-Path -LiteralPath $InstallDir)) {
+    Write-Log ('[FAIL] 安装目录不存在: ' + $InstallDir)
+    throw ('安装目录不存在: ' + $InstallDir)
+}
+if (-not (Test-Path -LiteralPath $AppDir)) {
+    Write-Log '[FAIL] app 目录不存在：上次更新可能中断在目录切换阶段'
+    Write-Log '请先运行同目录的 AIUI_Recover_App 恢复 app 目录，再重新执行更新'
+    throw ('app 目录不存在: ' + $AppDir)
+}
+if (-not (Test-Path -LiteralPath $configPath)) {
+    Write-Log ('[FAIL] 缺少运行配置: ' + $configPath)
+    throw ('缺少运行配置: ' + $configPath)
+}
 $sep = [System.IO.Path]::DirectorySeparatorChar
 if ($RuntimeDir -eq $AppDir -or $RuntimeDir.StartsWith($AppDir + $sep, [System.StringComparison]::OrdinalIgnoreCase)) {
     throw 'runtime 目录位于 app 目录内，无法安全整体替换；请先迁移到 app/runtime 分离布局。'
@@ -426,6 +457,10 @@ try {
     Invoke-SelfCheck
 
     Write-Log ('切换 app 目录: ' + $AppDir + ' -> ' + $backup)
+    # 先把脚本自身的工作目录移出 staging，再清掉仍占用 staging 的残留进程，
+    # 否则 Windows 会以 Access denied 拒绝重命名目录。
+    Set-Location -LiteralPath $InstallDir
+    Stop-DirectoryHolders $staging
     $moved = $false
     for ($i = 1; $i -le 10; $i++) {
         try {

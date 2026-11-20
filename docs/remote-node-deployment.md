@@ -202,6 +202,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File D:\AIUI\deploy\remote_selfch
 | `aiui-platform` | `aiui/platform`、平台脚本/文档/测试 |
 | `aiui-executor` | `aiui/agent`、`aiui/toolservers`、`deploy/` 脚本、执行机测试 |
 
+## 更新中断恢复
+
+更新在“切换 app 目录”阶段被拒绝（`Access to the path ...\app.staging-* is denied`）
+时，说明 staging 目录仍有进程或筛选器持有句柄。旧版更新脚本可能留下
+`D:\AIUI\app.prev-*` 而没有 `app` 目录。
+
+1. 运行同目录的 `AIUI_Recover_App.bat`：优先把最新的 `app.staging-*`
+   （刚自检通过的新版本）恢复为 `app`，失败则回退到最新的 `app.prev-*`，并重启计划任务。
+2. 确认 `D:\AIUI\app\VERSION` 存在后，再执行更新。
+
+更新脚本在切换前会先释放自身工作目录、停止仍引用 staging 的残留进程，并对
+`app -> app.prev` 与 `staging -> app` 两次重命名分别重试；失败时会恢复原 app。
+`AIUI_Update_Remote_Node` 包装器会校验制品包 SHA256，并从包内提取
+`deploy\update_remote_node.ps1` / `remote_selfcheck.ps1` 覆盖到 `D:\AIUI\deploy`，
+避免远程机继续使用旧版切换逻辑。
+
 `aiui-platform` 和 `aiui-executor` 各自自带一份 `aiui/common/` 副本；修改共享模块先改
 `aiui-common`，再把三份副本同步一致。原 monorepo（`AIUI_test_v4`）保留为集成验证与
 历史归档仓库，不再作为执行机部署来源。
