@@ -182,6 +182,8 @@ _INSPECT_JS = r"""
       label: labelFor(e),
       selector: selectorFor(e)
     }));
+  const form_selectors = forms.filter(f => f.label && f.selector)
+    .map(f => ({label: f.label, selector: f.selector, type: f.type}));
   const buttons = [...document.querySelectorAll('button,[role=button]')]
     .filter(vis).map(e => cut(e.innerText || e.getAttribute('aria-label'), 60))
     .filter(Boolean).slice(0, 40);
@@ -201,6 +203,7 @@ _INSPECT_JS = r"""
     title: document.title,
     breadcrumb,
     menus,
+    form_selectors,
     forms,
     buttons,
     tables,
@@ -430,6 +433,11 @@ def _system_prompt(case, tools, max_steps):
     inspect_page 的 forms 已带 selector，可直接用于 click/type，不需要为了拿 ref 再整页快照。
 15. 点击顶部菜单前先确认目标文本完全匹配；顶部菜单可能被多个容器包含，避免点到相邻菜单。
     每次菜单点击后确认面包屑或页面特征，不要连续盲点。
+16. 点击菜单后直接用 browser_find 找下一级目标，不要为了确认子菜单展开而额外 inspect_page；
+    只有找不到目标或需要读取页面数据时才观察。
+17. inspect_page 的 form_selectors 已给出可直接用于 click/type 的 selector；不要写 JS 扫描输入框。
+    查询/提交后需要读表格时，优先 inspect_page(include_tables=true)，不要手工拼 DOM 表格。
+18. 同名菜单/标签优先使用 browser_find 返回的可见 ref；避免点到隐藏的 menuContainer 容器。
 """
 
 
