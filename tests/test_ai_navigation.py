@@ -77,10 +77,16 @@ class NavigationPromptTests(unittest.IsolatedAsyncioTestCase):
         payload = {
             "url": "http://example.test/home", "title": "首页",
             "breadcrumb": ["柜台委托", "盘后固定价格交易"],
-            "menus": ["柜台委托"], "forms": [], "tables": [], "messages": [],
+            "menus": ["柜台委托"],
+            "forms": [{"label": "委托价格：", "value": "330.0000",
+                       "selector": '.af-form-item:has-text("委托价格：") input'}],
+            "tables": [{"headers": ["价格上限", "价格下限"],
+                        "rows": [["330.0000", "270.0000"]]}],
+            "messages": [],
         }
         session = EvalSession("### Result\n" + json.dumps(payload, ensure_ascii=False)
                               + "\n### Ran Playwright code")
+        seen = []
 
         class Client:
             model, provider = "test-model", "test"
@@ -89,6 +95,7 @@ class NavigationPromptTests(unittest.IsolatedAsyncioTestCase):
                 self.count = 0
 
             def chat(self, messages, system, max_tokens, temperature):
+                seen.append(json.dumps(messages, ensure_ascii=False))
                 self.count += 1
                 if self.count == 1:
                     text = {"action": "tool", "tool": "inspect_page",
@@ -109,8 +116,13 @@ class NavigationPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["steps"][0]["tool"], "inspect_page")
         self.assertIn("盘后固定价格交易", result["steps"][0]["result"])
+        self.assertIn("selector", result["steps"][0]["result"])
         self.assertEqual(session.calls[0][0], "browser_evaluate")
         self.assertIn("function", session.calls[0][1])
+        judge_content = json.loads(seen[-1])[0]["content"]
+        self.assertIn("关键页面状态", judge_content)
+        self.assertIn("330.0000", judge_content)
+        self.assertIn("委托价格", judge_content)
 
 
 class VirtualToolTests(unittest.IsolatedAsyncioTestCase):
@@ -148,6 +160,9 @@ class AuditTests(unittest.TestCase):
         self.assertTrue(any("直接改值" in w for w in warnings))
         self.assertEqual(ai_executor._audit_tool_use(
             "browser_evaluate", {"function": "document.body.innerText"}, state), [])
+        warnings = ai_executor._audit_tool_use(
+            "browser_snapshot", {}, {"inspect_available": True})
+        self.assertTrue(any("整页快照" in w for w in warnings))
 
     def test_judge_transcript_includes_user_level_warnings(self):
         steps = [{"tool": "browser_navigate", "args": {"url": "http://x"},
