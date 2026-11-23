@@ -335,6 +335,7 @@ class Agent:
         errlog = None
         tail = None
         err_path = None
+        run_state = {"committed": False}
         if (mcp.get("transport") or "stdio").lower() == "stdio":
             try:
                 fd, err_path = tempfile.mkstemp(prefix="mcp-stderr-", suffix=".log")
@@ -426,8 +427,17 @@ class Agent:
                         reporter.log(rec["screenshot"]["error"], level="warn", source="screenshot")
                     if error:
                         out["error"] = error
+                        if run_state["committed"] or case.get("side_effect"):
+                            out["retryable"] = False
+                            reporter.log("已进入提交/副作用步骤，后续失败不再自动重试",
+                                         level="warn", source="agent")
                         reporter.log(f"[{i}/{len(steps)}] {tool} 失败: {error[:800]}", level="error")
                         return out
+
+                    if step.get("commit"):
+                        run_state["committed"] = True
+                        reporter.log(f"[{i}/{len(steps)}] 已执行提交步骤；后续失败不自动重试",
+                                     source="agent")
 
                     if tool == "page_text" and obj.get("text"):
                         out["final_text"] = str(obj["text"])[:2000]
@@ -442,10 +452,14 @@ class Agent:
             return await asyncio.wait_for(body(), timeout=timeout)
         except asyncio.TimeoutError:
             out["error"] = f"任务超时({timeout:.0f}s)"
+            if run_state["committed"] or case.get("side_effect"):
+                out["retryable"] = False
             reporter.log(out["error"], level="error")
             return out
         except Exception as e:
             out["error"] = mcp_runtime.describe_exc(e)
+            if run_state["committed"] or case.get("side_effect"):
+                out["retryable"] = False
             reporter.log(f"MCP 会话异常: {out['error']}", level="error")
             return out
         finally:

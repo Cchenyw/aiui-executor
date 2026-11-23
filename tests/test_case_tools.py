@@ -66,3 +66,61 @@ class ScriptedToolValidationTests(unittest.IsolatedAsyncioTestCase):
         ])
         self.assertTrue(result["ok"])
         self.assertEqual(calls, ["navigate"])
+
+
+class CommitRetryTests(unittest.IsolatedAsyncioTestCase):
+    async def execute(self, steps, side_effect=False):
+        calls = []
+
+        class Session:
+            async def list_tools(self):
+                return SimpleNamespace(tools=[
+                    SimpleNamespace(name="navigate"),
+                    SimpleNamespace(name="click"),
+                ])
+
+            async def call_tool(self, name, args, **kwargs):
+                calls.append(name)
+                if name == "click":
+                    return SimpleNamespace(is_error=True, content=[SimpleNamespace(
+                        type="text", text=json.dumps({"error": "校验失败"}))])
+                return SimpleNamespace(is_error=False, content=[SimpleNamespace(
+                    type="text", text=json.dumps({"ok": True}))])
+
+        @contextlib.asynccontextmanager
+        async def open_session(*args, **kwargs):
+            yield Session()
+
+        agent = runner.Agent("http://unused", "test", "127.0.0.1", 0, 1, None)
+        self.addCleanup(agent.pool.shutdown)
+        task = {"case": {"mode": "scripted", "timeout_s": 15,
+                         "side_effect": side_effect, "steps": steps},
+                "mcp": {"id": "builtin-browser", "transport": "http"}}
+        with patch.object(runner.mcp_runtime, "open_session", open_session):
+            result = await agent._execute(task, Reporter())
+        return result
+
+    async def test_failure_after_commit_is_not_retryable(self):
+        result = await self.execute([
+            {"tool": "navigate", "args": {}, "commit": True},
+            {"tool": "click", "args": {}},
+        ])
+        self.assertFalse(result["ok"])
+        self.assertIs(result.get("retryable"), False)
+        self.assertEqual(result["steps"][0]["ok"], True)
+
+    async def test_side_effect_failure_is_not_retryable_without_commit_marker(self):
+        result = await self.execute([
+            {"tool": "navigate", "args": {}},
+            {"tool": "click", "args": {}},
+        ], side_effect=True)
+        self.assertFalse(result["ok"])
+        self.assertIs(result.get("retryable"), False)
+
+    async def test_ordinary_failure_keeps_default_retry(self):
+        result = await self.execute([
+            {"tool": "navigate", "args": {}},
+            {"tool": "click", "args": {}},
+        ])
+        self.assertFalse(result["ok"])
+        self.assertIsNot(result.get("retryable"), False)
