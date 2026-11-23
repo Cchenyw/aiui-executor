@@ -30,7 +30,7 @@ NAV_TOOLS = ("browser_navigate", "playwright_navigate", "navigate")
 ACTOR_MAX_TOKENS = 1500
 JUDGE_MAX_TOKENS = 2000
 OBSERVATION_KEEP = 6
-ACTOR_CONTEXT_TOKEN_BUDGET = 12000
+ACTOR_CONTEXT_TOKEN_BUDGET = 9000
 TASK_MEMORY_MAX_CHARS = 4000
 OBSERVATION_TOOLS = ("snapshot", "page_text", "playwright_get_visible_text",
                      "browser_snapshot", "playwright_get_visible_html")
