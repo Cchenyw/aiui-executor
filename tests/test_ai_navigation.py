@@ -147,6 +147,33 @@ class VirtualToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0][0], "browser_evaluate")
 
 
+class ObservationCompactionTests(unittest.TestCase):
+    def test_only_old_tool_observations_are_truncated_once(self):
+        messages = [{"role": "user", "content": "初始目标：点击菜单"}]
+        for i in range(5):
+            messages.append({
+                "role": "user",
+                "content": f"工具 tool{i} 返回：\n" + ("x" * 2000),
+            })
+        compacted = ai_executor._compact_old_observations(
+            messages, keep=3, limit=100)
+        self.assertEqual(compacted, 2)
+        self.assertIn("早期观察已压缩", messages[1]["content"])
+        self.assertIn("早期观察已压缩", messages[2]["content"])
+        self.assertNotIn("早期观察已压缩", messages[3]["content"])
+        self.assertEqual(messages[0]["content"], "初始目标：点击菜单")
+        self.assertGreater(len(messages[5]["content"]), 100)
+        self.assertEqual(ai_executor._compact_old_observations(
+            messages, keep=3, limit=100), 0)
+
+    def test_short_or_within_window_observations_are_untouched(self):
+        messages = [{"role": "user", "content": f"工具 t{i} 返回：ok"} for i in range(5)]
+        self.assertEqual(ai_executor._compact_old_observations(
+            messages, keep=3, limit=100), 0)
+        self.assertTrue(all(m["content"] == "工具 t%d 返回：ok" % i
+                            for i, m in enumerate(messages)))
+
+
 class AuditTests(unittest.TestCase):
     def test_audit_flags_direct_navigation_and_js_writes_without_blocking(self):
         state = {}

@@ -29,6 +29,8 @@ NAV_TOOLS = ("browser_navigate", "playwright_navigate", "navigate")
 # 预算过小会导致正文为空或被截断，判定 JSON 因此无法解析。
 ACTOR_MAX_TOKENS = 1500
 JUDGE_MAX_TOKENS = 2000
+OBSERVATION_KEEP = 12
+OBSERVATION_COMPACT_CHARS = 800
 OBSERVATION_TOOLS = ("snapshot", "page_text", "playwright_get_visible_text",
                      "browser_snapshot", "playwright_get_visible_html")
 
@@ -133,6 +135,32 @@ def _page_text(text, limit=2000):
     except Exception:
         pass
     return (text or "")[:limit]
+
+
+def _compact_old_observations(messages, keep=OBSERVATION_KEEP,
+                              limit=OBSERVATION_COMPACT_CHARS):
+    """压缩超出最近窗口的工具观察，避免多步 AI 用例上下文线性膨胀。
+
+    只处理以“工具 ...”开头的观察消息；最近 keep 条保持完整，更早的截断为
+    limit 字符并加标记。页面状态摘录、步骤结果和判定器证据不受影响。
+    """
+    indices = [
+        i for i, msg in enumerate(messages or [])
+        if msg.get("role") == "user"
+        and str(msg.get("content") or "").startswith("工具 ")
+    ]
+    if keep > 0 and len(indices) <= keep:
+        return 0
+    old = indices[:-keep] if keep > 0 else indices
+    compacted = 0
+    for i in old:
+        content = str(messages[i].get("content") or "")
+        if "早期观察已压缩" in content or len(content) <= limit:
+            continue
+        messages[i]["content"] = (
+            content[:limit] + "\n…（早期观察已压缩，只保留开头；需要时重新观察）")
+        compacted += 1
+    return compacted
 
 
 _INSPECT_JS = r"""
@@ -551,6 +579,7 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
         "judge_status": "not_run", "judge_error": "", "actor_verdict": "",
         "retryable": False, "usage": {}, "ai_model": "", "budget": {},
         "user_level_warnings": [], "navigation_hint_used": False,
+        "observations_compacted": 0,
     })
     cfg = config or load_llm_config()
     try:
@@ -615,6 +644,12 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
         remaining = deadline - time.monotonic()
         if remaining < 3:
             break
+        compacted = _compact_old_observations(messages)
+        if compacted:
+            out["observations_compacted"] += compacted
+            reporter.log(
+                f"已压缩 {compacted} 条早期工具观察（保留最近 "
+                f"{OBSERVATION_KEEP} 条完整）", source="agent")
         res, err = await _ask(client, messages, system, reporter, remaining - 1,
                               ACTOR_MAX_TOKENS, f"第 {turn} 步")
         if not res:
