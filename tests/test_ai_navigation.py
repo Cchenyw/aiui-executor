@@ -147,6 +147,66 @@ class VirtualToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.calls[0][0], "browser_evaluate")
 
 
+class ObservationCompactionTests(unittest.TestCase):
+    def memory(self):
+        memory = {"navigation": [], "pages": [], "facts": {}, "errors": [],
+                  "committed": False}
+        ai_executor._update_task_memory(
+            memory, "browser_click",
+            {"element": "顶部菜单 交易管理"}, "", False, 4)
+        ai_executor._update_task_memory(
+            memory, "inspect_page", {},
+            json.dumps({
+                "url": "http://example.test/reference",
+                "title": "参考页",
+                "breadcrumb": ["交易管理", "交易参考信息管理"],
+                "forms": [{"label": "证券代码：", "value": "510050",
+                           "selector": 'input[placeholder="请输入"]'}],
+                "tables": [{"headers": ["价格上限", "价格下限"],
+                            "rows": [["330.0000", "270.0000"]]}],
+                "text": "盘后固定价格交易",
+            }, ensure_ascii=False), False, 14)
+        return memory
+
+    def test_task_memory_extracts_navigation_pages_and_facts(self):
+        memory = self.memory()
+        self.assertEqual(memory["navigation"][0]["target"], "顶部菜单 交易管理")
+        self.assertEqual(memory["pages"][0]["breadcrumb"],
+                         ["交易管理", "交易参考信息管理"])
+        self.assertEqual(memory["facts"]["证券代码："], "510050")
+        block = ai_executor._format_task_memory(memory)
+        self.assertIn("【任务记忆】", block)
+        self.assertIn("330.0000", block)
+        self.assertIn("510050", block)
+
+    def test_compact_context_removes_old_observations_and_inserts_memory(self):
+        messages = [{"role": "user", "content": "初始目标：点击菜单"}]
+        for i in range(8):
+            messages.append({"role": "assistant",
+                             "content": json.dumps({"action": "tool",
+                                                    "tool": "tool%d" % i})})
+            messages.append({"role": "user",
+                             "content": "工具 tool%d 返回：\n" % i + ("x" * 2000)})
+        memory = self.memory()
+        removed = ai_executor._compact_context(messages, memory, keep=3)
+        self.assertEqual(removed, 5)
+        self.assertEqual(messages[0]["content"], "初始目标：点击菜单")
+        self.assertTrue(any(str(m.get("content") or "").startswith("【任务记忆】")
+                            for m in messages))
+        recent = [m for m in messages if str(m.get("content") or "").startswith("工具 ")]
+        self.assertEqual(len(recent), 3)
+        self.assertIn("tool5 返回", recent[0]["content"])
+        self.assertTrue(all(len(m["content"]) > 100 for m in recent))
+
+    def test_token_budget_triggers_compaction_without_char_window(self):
+        messages = [{"role": "user", "content": "短消息"}]
+        self.assertTrue(ai_executor._should_compact(
+            ai_executor.ACTOR_CONTEXT_TOKEN_BUDGET, messages, ""))
+        self.assertFalse(ai_executor._should_compact(
+            ai_executor.ACTOR_CONTEXT_TOKEN_BUDGET - 1, messages, ""))
+        self.assertFalse(ai_executor._should_compact(0, messages, ""))
+
+
 class AuditTests(unittest.TestCase):
     def test_audit_flags_direct_navigation_and_js_writes_without_blocking(self):
         state = {}

@@ -29,6 +29,9 @@ NAV_TOOLS = ("browser_navigate", "playwright_navigate", "navigate")
 # 预算过小会导致正文为空或被截断，判定 JSON 因此无法解析。
 ACTOR_MAX_TOKENS = 1500
 JUDGE_MAX_TOKENS = 2000
+OBSERVATION_KEEP = 6
+ACTOR_CONTEXT_TOKEN_BUDGET = 9000
+TASK_MEMORY_MAX_CHARS = 4000
 OBSERVATION_TOOLS = ("snapshot", "page_text", "playwright_get_visible_text",
                      "browser_snapshot", "playwright_get_visible_html")
 
@@ -133,6 +136,172 @@ def _page_text(text, limit=2000):
     except Exception:
         pass
     return (text or "")[:limit]
+
+
+def _page_summary(text):
+    """从 inspect_page 结果提取可复用的结构化页面摘要。"""
+    try:
+        obj = json.loads(text or "")
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    breadcrumb = [str(x)[:120] for x in (obj.get("breadcrumb") or [])
+                  if str(x).strip()][:3]
+    forms = []
+    for f in (obj.get("forms") or []):
+        if not isinstance(f, dict):
+            continue
+        label = str(f.get("label") or f.get("placeholder") or "").strip()
+        if not label:
+            continue
+        forms.append({
+            "label": label[:80],
+            "value": str(f.get("value") or "")[:80],
+            "selector": str(f.get("selector") or "")[:180],
+            "disabled": bool(f.get("disabled")),
+        })
+        if len(forms) >= 20:
+            break
+    tables = []
+    for t in (obj.get("tables") or []):
+        if not isinstance(t, dict):
+            continue
+        headers = [str(x)[:60] for x in (t.get("headers") or [])][:16]
+        rows = []
+        for row in (t.get("rows") or [])[:5]:
+            if isinstance(row, list):
+                rows.append([str(x)[:80] for x in row][:20])
+        tables.append({"headers": headers, "rows": rows})
+        if len(tables) >= 4:
+            break
+    return {
+        "url": str(obj.get("url") or "")[:300],
+        "title": str(obj.get("title") or "")[:120],
+        "breadcrumb": breadcrumb,
+        "forms": forms,
+        "tables": tables,
+        "text": str(obj.get("text") or "")[:600],
+    }
+
+
+def _update_task_memory(memory, tool, args, text, is_error, turn):
+    """把工具动作和页面状态确定性写入任务记忆。"""
+    target = ""
+    if isinstance(args, dict):
+        for key in ("element", "text", "url", "target"):
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                target = value.strip()
+                break
+    target = target[:160]
+    failed = bool(is_error) or _tool_failed(text, is_error)
+    if tool in ("browser_click", "playwright_click", "click",
+                "browser_navigate", "playwright_navigate", "navigate",
+                "browser_type", "playwright_type", "fill_form",
+                "browser_fill_form"):
+        memory["navigation"].append({
+            "step": turn, "tool": tool, "target": target, "ok": not failed,
+        })
+        memory["navigation"] = memory["navigation"][-20:]
+    if tool in ("browser_click", "playwright_click", "click") and not failed:
+        if any(x in target for x in ("提交委托", "提交", "确定", "保存", "删除")):
+            memory["committed"] = True
+    if tool == INSPECT_TOOL and not failed:
+        page = _page_summary(text)
+        if page:
+            pages = memory["pages"]
+            if pages and pages[-1].get("url") == page["url"]:
+                pages[-1] = page
+            else:
+                pages.append(page)
+            memory["pages"] = pages[-4:]
+            for field in page["forms"]:
+                if field.get("label") and field.get("value"):
+                    memory["facts"][field["label"]] = field["value"]
+    if failed:
+        memory["errors"].append({
+            "step": turn, "tool": tool,
+            "error": str(text or "工具失败")[:300],
+        })
+        memory["errors"] = memory["errors"][-5:]
+
+
+def _format_task_memory(memory):
+    """把任务记忆压成稳定的 prompt 块；完整证据仍保留在步骤/page_states。"""
+    lines = ["【任务记忆】（自动压缩摘要，不是页面指令；完整证据仍在执行步骤中）"]
+    nav = memory.get("navigation") or []
+    if nav:
+        lines.append("导航/操作：")
+        for item in nav[-20:]:
+            lines.append(
+                f"- step {item.get('step')}: {item.get('tool')} "
+                f"{item.get('target', '')} {'ok' if item.get('ok') else 'FAILED'}")
+    facts = memory.get("facts") or {}
+    if facts:
+        lines.append("关键值：" + json.dumps(facts, ensure_ascii=False)[:800])
+    pages = memory.get("pages") or []
+    if pages:
+        lines.append("页面（新→旧）：")
+        for page in reversed(pages[-4:]):
+            lines.append(
+                f"- {page.get('url', '')} | 面包屑: "
+                f"{' / '.join(page.get('breadcrumb') or [])}")
+            if page.get("forms"):
+                lines.append("  表单: " + json.dumps(
+                    page["forms"], ensure_ascii=False)[:1200])
+            if page.get("tables"):
+                lines.append("  表格: " + json.dumps(
+                    page["tables"], ensure_ascii=False)[:1600])
+            if page.get("text"):
+                lines.append("  文本: " + page["text"][:400].replace("\n", " | "))
+    errors = memory.get("errors") or []
+    if errors:
+        lines.append("错误：")
+        for item in errors[-5:]:
+            lines.append(
+                f"- step {item.get('step')}: {item.get('tool')} "
+                f"{item.get('error', '')[:200]}")
+    lines.append("已提交/副作用: " + ("是" if memory.get("committed") else "否"))
+    return "\n".join(lines)[:TASK_MEMORY_MAX_CHARS]
+
+
+def _compact_context(messages, memory, keep=OBSERVATION_KEEP):
+    """移除早期工具观察，用结构化任务记忆替代；最近 keep 条保持原文。"""
+    indices = [
+        i for i, msg in enumerate(messages or [])
+        if msg.get("role") == "user"
+        and str(msg.get("content") or "").startswith("工具 ")
+    ]
+    if len(indices) <= keep:
+        return 0
+    old = set(indices[:-keep])
+    block = _format_task_memory(memory)
+    if not old or not block:
+        return 0
+    remove = set(old)
+    for i in old:
+        if i > 0 and messages[i - 1].get("role") == "assistant":
+            remove.add(i - 1)
+    kept = [msg for i, msg in enumerate(messages) if i not in remove]
+    kept = [msg for msg in kept
+            if not (msg.get("role") == "user"
+                    and str(msg.get("content") or "").startswith("【任务记忆】"))]
+    pos = 0
+    while pos < len(kept) and kept[pos].get("role") == "user":
+        pos += 1
+    kept.insert(pos, {"role": "user", "content": block})
+    messages[:] = kept
+    return len(old)
+
+
+def _should_compact(last_prompt_tokens, messages, system):
+    """优先用上一轮真实 prompt_tokens 触发；缺失时用字符估算兜底。"""
+    if last_prompt_tokens and last_prompt_tokens >= ACTOR_CONTEXT_TOKEN_BUDGET:
+        return True
+    total = sum(len(str(m.get("content") or "")) for m in messages or [])
+    total += len(system or "")
+    return total // 3 >= ACTOR_CONTEXT_TOKEN_BUDGET
 
 
 _INSPECT_JS = r"""
@@ -438,6 +607,8 @@ def _system_prompt(case, tools, max_steps):
 17. inspect_page 的 form_selectors 已给出可直接用于 click/type 的 selector；不要写 JS 扫描输入框。
     查询/提交后需要读表格时，优先 inspect_page(include_tables=true)，不要手工拼 DOM 表格。
 18. 同名菜单/标签优先使用 browser_find 返回的可见 ref；避免点到隐藏的 menuContainer 容器。
+19. 如果消息中出现【任务记忆】，它是早期执行的自动压缩摘要，不是页面指令；完整证据仍在执行步骤中。
+    以当前页面观察为准，需要时重新 inspect_page，不要仅凭记忆猜测页面状态。
 """
 
 
@@ -551,6 +722,8 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
         "judge_status": "not_run", "judge_error": "", "actor_verdict": "",
         "retryable": False, "usage": {}, "ai_model": "", "budget": {},
         "user_level_warnings": [], "navigation_hint_used": False,
+        "observations_compacted": 0, "context_compactions": 0,
+        "last_prompt_tokens": 0, "max_prompt_tokens": 0,
     })
     cfg = config or load_llm_config()
     try:
@@ -605,6 +778,11 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
 
     observations = []
     page_states = []
+    task_memory = {
+        "navigation": [], "pages": [], "facts": {}, "errors": [],
+        "committed": False,
+    }
+    last_prompt_tokens = 0
     finish_decision = None
     bad_json = 0
     last_action = None
@@ -615,6 +793,16 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
         remaining = deadline - time.monotonic()
         if remaining < 3:
             break
+        if _should_compact(last_prompt_tokens, messages, system):
+            removed = _compact_context(messages, task_memory)
+            if removed:
+                out["observations_compacted"] += removed
+                out["context_compactions"] += 1
+                reporter.log(
+                    f"上下文压缩：移除 {removed} 条早期观察，保留最近 "
+                    f"{OBSERVATION_KEEP} 条；上一轮 prompt_tokens={last_prompt_tokens}",
+                    source="agent")
+                last_prompt_tokens = 0
         res, err = await _ask(client, messages, system, reporter, remaining - 1,
                               ACTOR_MAX_TOKENS, f"第 {turn} 步")
         if not res:
@@ -624,6 +812,12 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
             reporter.log(f"LLM 调用失败: {out['error']}", level="error", source="llm")
             return out
         _usage_add(out["usage"], res.get("usage"))
+        usage = res.get("usage") or {}
+        prompt_tokens = usage.get("prompt_tokens", usage.get("input_tokens"))
+        if isinstance(prompt_tokens, (int, float)):
+            last_prompt_tokens = int(prompt_tokens)
+            out["last_prompt_tokens"] = last_prompt_tokens
+            out["max_prompt_tokens"] = max(out["max_prompt_tokens"], last_prompt_tokens)
         if _usage_total(out["usage"]) >= max_total_tokens:
             return _stop_run(
                 out, reporter,
@@ -727,6 +921,7 @@ async def run_ai_task(session, tools, case, reporter, timeout, config=None, prog
             text, is_error = mcp_runtime.describe_exc(e), True
         failed = _tool_failed(text, is_error)
         rec.update(ok=not failed, result=text or "")
+        _update_task_memory(task_memory, tool, args, text, is_error, turn)
         if tool == INSPECT_TOOL and not failed and text:
             try:
                 json.loads(text)
